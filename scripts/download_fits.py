@@ -7,11 +7,17 @@ import os
 import re
 import sys
 import argparse
+import asyncio
+import time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
-import requests
+import httpx
 from bs4 import BeautifulSoup
-import time
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
+from rich.panel import Panel
+from rich.table import Table
+from rich import print as rprint
 
 
 def parse_directory_listing(html_content):
@@ -38,57 +44,89 @@ def parse_directory_listing(html_content):
     return files
 
 
-def download_file(url, local_path, chunk_size=8192):
+async def download_file_with_progress(client, url, local_path, progress, task_id, chunk_size=8192):
     """
-    Download a file with progress indication.
+    Download a file with rich progress indication using httpx.
     
     Args:
+        client (httpx.AsyncClient): HTTP client
         url (str): URL to download from
         local_path (str): Local path to save the file
+        progress (Progress): Rich progress object
+        task_id: Task ID for the progress bar
         chunk_size (int): Chunk size for downloading
         
     Returns:
         bool: True if download successful, False otherwise
     """
     try:
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
-        
-        total_size = int(response.headers.get('content-length', 0))
-        downloaded = 0
-        
-        with open(local_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=chunk_size):
-                if chunk:
+        async with client.stream('GET', url) as response:
+            response.raise_for_status()
+            
+            total_size = int(response.headers.get('content-length', 0))
+            downloaded = 0
+            
+            # Update progress task with total size
+            progress.update(task_id, total=total_size)
+            
+            with open(local_path, 'wb') as f:
+                async for chunk in response.aiter_bytes(chunk_size=chunk_size):
                     f.write(chunk)
                     downloaded += len(chunk)
-                    
-                    # Print progress
-                    if total_size > 0:
-                        percent = (downloaded / total_size) * 100
-                        print(f"\rDownloading {os.path.basename(local_path)}: {percent:.1f}%", end='', flush=True)
+                    progress.update(task_id, completed=downloaded)
         
-        print()  # New line after progress
         return True
         
     except Exception as e:
-        print(f"\nError downloading {url}: {e}")
+        progress.console.print(f"[red]Error downloading {url}: {e}[/red]")
         return False
 
 
-def download_date_data(date, base_url="http://72.233.250.83/data/ecam", output_dir="data", force=False):
+async def check_file_exists(url, local_path, force=False):
     """
-    Download all FITS files for a specific date.
+    Check if a file already exists and is complete.
+    
+    Args:
+        url (str): URL to check
+        local_path (Path): Local file path
+        force (bool): Force re-download
+        
+    Returns:
+        tuple: (should_skip, reason)
+    """
+    if not local_path.exists() or force:
+        return False, None
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            head_response = await client.head(url)
+            expected_size = int(head_response.headers.get('content-length', 0))
+            actual_size = local_path.stat().st_size
+            
+            if expected_size > 0 and actual_size == expected_size:
+                return True, f"already exists, size: {actual_size:,} bytes"
+            else:
+                return False, f"incomplete file, expected: {expected_size:,}, actual: {actual_size:,}"
+    except Exception as e:
+        return False, f"could not verify file size: {e}"
+
+
+async def download_date_data_async(date, base_url="http://72.233.250.83/data/ecam", output_dir="data", force=False, max_concurrent=5):
+    """
+    Download all FITS files for a specific date using async/await.
     
     Args:
         date (str): Date in YYYYMMDD format
         base_url (str): Base URL for the data server
         output_dir (str): Output directory for downloaded files
         force (bool): Force re-download of existing files
+        max_concurrent (int): Maximum number of concurrent downloads
         
     Returns:
         bool: True if successful, False otherwise
     """
+    console = Console()
+    
     # Create the URL for the date
     date_url = f"{base_url}/{date}/"
     
@@ -96,82 +134,143 @@ def download_date_data(date, base_url="http://72.233.250.83/data/ecam", output_d
     date_dir = Path(output_dir) / date
     date_dir.mkdir(parents=True, exist_ok=True)
     
-    print(f"Fetching directory listing for {date}...")
-    print(f"URL: {date_url}")
+    console.print(f"[bold blue]Fetching directory listing for {date}...[/bold blue]")
+    console.print(f"[dim]URL: {date_url}[/dim]")
     
     try:
         # Get the directory listing
-        response = requests.get(date_url)
-        response.raise_for_status()
-        
-        # Parse the HTML to get file list
-        files = parse_directory_listing(response.text)
-        
-        if not files:
-            print(f"No FITS files found for date {date}")
-            return False
-        
-        print(f"Found {len(files)} FITS files to download")
-        
-        # Statistics tracking
-        downloaded_count = 0
-        skipped_count = 0
-        failed_count = 0
-        
-        # Download each file
-        for i, filename in enumerate(files, 1):
-            file_url = urljoin(date_url, filename)
-            local_path = date_dir / filename
+        async with httpx.AsyncClient() as client:
+            response = await client.get(date_url)
+            response.raise_for_status()
             
-            # Check if file already exists and is complete
-            if local_path.exists() and not force:
-                # Get expected file size from server
-                try:
-                    head_response = requests.head(file_url)
-                    expected_size = int(head_response.headers.get('content-length', 0))
-                    actual_size = local_path.stat().st_size
+            # Parse the HTML to get file list
+            files = parse_directory_listing(response.text)
+            
+            if not files:
+                console.print(f"[yellow]No FITS files found for date {date}[/yellow]")
+                return False
+            
+            console.print(f"[green]Found {len(files)} FITS files to download[/green]")
+            console.print(f"[cyan]Using {max_concurrent} concurrent downloads[/cyan]")
+            
+            # Statistics tracking
+            downloaded_count = 0
+            skipped_count = 0
+            failed_count = 0
+            
+            # Create progress bar
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TextColumn("•"),
+                TimeElapsedColumn(),
+                TextColumn("•"),
+                TimeRemainingColumn(),
+                console=console
+            ) as progress:
+                
+                # Create main task for overall progress
+                main_task = progress.add_task(
+                    f"[cyan]Downloading {len(files)} files...", 
+                    total=len(files)
+                )
+                
+                # Create semaphore to limit concurrent downloads
+                semaphore = asyncio.Semaphore(max_concurrent)
+                
+                async def download_single_file(filename, file_index):
+                    """Download a single file with semaphore control."""
+                    nonlocal downloaded_count, skipped_count, failed_count
                     
-                    if expected_size > 0 and actual_size == expected_size:
-                        print(f"[{i}/{len(files)}] Skipping {filename} (already exists, size: {actual_size:,} bytes)")
+                    file_url = urljoin(date_url, filename)
+                    local_path = date_dir / filename
+                    
+                    # Check if file already exists and is complete
+                    should_skip, reason = await check_file_exists(file_url, local_path, force)
+                    
+                    if should_skip:
+                        progress.console.print(f"[dim]Skipping {filename} ({reason})[/dim]")
                         skipped_count += 1
-                        continue
-                    else:
-                        print(f"[{i}/{len(files)}] Re-downloading {filename} (incomplete file, expected: {expected_size:,}, actual: {actual_size:,})")
-                except Exception as e:
-                    print(f"[{i}/{len(files)}] Re-downloading {filename} (could not verify file size: {e})")
+                        progress.advance(main_task)
+                        return
+                    elif reason:
+                        progress.console.print(f"[yellow]Re-downloading {filename} ({reason})[/yellow]")
+                    
+                    # Create individual file task
+                    file_task = progress.add_task(
+                        f"[white]{filename}[/white]", 
+                        total=None
+                    )
+                    
+                    async with semaphore:
+                        # Download the file
+                        if await download_file_with_progress(client, file_url, local_path, progress, file_task):
+                            downloaded_count += 1
+                            progress.console.print(f"[green]✓ Downloaded {filename}[/green]")
+                        else:
+                            failed_count += 1
+                            progress.console.print(f"[red]✗ Failed to download {filename}[/red]")
+                    
+                    # Remove the file task and advance main task
+                    progress.remove_task(file_task)
+                    progress.advance(main_task)
+                
+                # Create all download tasks
+                tasks = [
+                    download_single_file(filename, i) 
+                    for i, filename in enumerate(files, 1)
+                ]
+                
+                # Execute all downloads concurrently
+                await asyncio.gather(*tasks)
             
-            print(f"[{i}/{len(files)}] Downloading {filename}...")
-            if download_file(file_url, local_path):
-                downloaded_count += 1
+            # Create summary table
+            summary_table = Table(title="Download Summary")
+            summary_table.add_column("Metric", style="cyan")
+            summary_table.add_column("Value", style="white")
+            
+            summary_table.add_row("Total files found", str(len(files)))
+            summary_table.add_row("Files downloaded", f"[green]{downloaded_count}[/green]")
+            summary_table.add_row("Files skipped", f"[yellow]{skipped_count}[/yellow]")
+            summary_table.add_row("Files failed", f"[red]{failed_count}[/red]")
+            summary_table.add_row("Files saved to", str(date_dir))
+            summary_table.add_row("Concurrent downloads", str(max_concurrent))
+            
+            console.print()
+            console.print(summary_table)
+            
+            if failed_count == 0:
+                console.print("\n[bold green]✅ All files processed successfully![/bold green]")
+                return True
             else:
-                failed_count += 1
-            
-            # Small delay to be nice to the server
-            time.sleep(0.1)
+                console.print(f"\n[bold yellow]⚠️  {failed_count} files failed to download.[/bold yellow]")
+                return False
         
-        # Print summary
-        print(f"\n" + "="*50)
-        print(f"DOWNLOAD SUMMARY")
-        print(f"="*50)
-        print(f"Total files found: {len(files)}")
-        print(f"Files downloaded: {downloaded_count}")
-        print(f"Files skipped: {skipped_count}")
-        print(f"Files failed: {failed_count}")
-        print(f"Files saved to: {date_dir}")
-        
-        if failed_count == 0:
-            print(f"\n✅ All files processed successfully!")
-            return True
-        else:
-            print(f"\n⚠️  {failed_count} files failed to download.")
-            return False
-        
-    except requests.exceptions.RequestException as e:
-        print(f"Error accessing {date_url}: {e}")
+    except httpx.RequestError as e:
+        console.print(f"[red]Error accessing {date_url}: {e}[/red]")
         return False
     except Exception as e:
-        print(f"Unexpected error: {e}")
+        console.print(f"[red]Unexpected error: {e}[/red]")
         return False
+
+
+def download_date_data(date, base_url="http://72.233.250.83/data/ecam", output_dir="data", force=False, max_concurrent=5):
+    """
+    Wrapper function to run the async download function.
+    
+    Args:
+        date (str): Date in YYYYMMDD format
+        base_url (str): Base URL for the data server
+        output_dir (str): Output directory for downloaded files
+        force (bool): Force re-download of existing files
+        max_concurrent (int): Maximum number of concurrent downloads
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    return asyncio.run(download_date_data_async(date, base_url, output_dir, force, max_concurrent))
 
 
 def main():
@@ -182,28 +281,39 @@ def main():
                        help="Base URL for the data server")
     parser.add_argument("--force", action="store_true", 
                        help="Force re-download of existing files")
+    parser.add_argument("--max-concurrent", type=int, default=5,
+                       help="Maximum number of concurrent downloads (default: 5)")
     
     args = parser.parse_args()
     
     # Validate date format
     if not re.match(r'^\d{8}$', args.date):
-        print("Error: Date must be in YYYYMMDD format (e.g., 20250704)")
+        rprint("[red]Error: Date must be in YYYYMMDD format (e.g., 20250704)[/red]")
         sys.exit(1)
     
-    print(f"Starting download for date: {args.date}")
-    print(f"Output directory: {args.output_dir}")
-    print(f"Base URL: {args.base_url}")
-    if args.force:
-        print(f"Force mode: Will re-download existing files")
-    print("-" * 50)
+    # Validate max_concurrent
+    if args.max_concurrent < 1:
+        rprint("[red]Error: max_concurrent must be at least 1[/red]")
+        sys.exit(1)
     
-    success = download_date_data(args.date, args.base_url, args.output_dir, args.force)
+    console = Console()
+    console.print(Panel.fit(
+        f"[bold blue]MRO Data Downloader[/bold blue]\n"
+        f"Date: [cyan]{args.date}[/cyan]\n"
+        f"Output: [cyan]{args.output_dir}[/cyan]\n"
+        f"Base URL: [cyan]{args.base_url}[/cyan]\n"
+        f"Force mode: [cyan]{'Yes' if args.force else 'No'}[/cyan]\n"
+        f"Max concurrent: [cyan]{args.max_concurrent}[/cyan]",
+        title="Configuration"
+    ))
+    
+    success = download_date_data(args.date, args.base_url, args.output_dir, args.force, args.max_concurrent)
     
     if success:
-        print("\n✅ All files processed successfully!")
+        console.print("\n[bold green]✅ All files processed successfully![/bold green]")
         sys.exit(0)
     else:
-        print("\n❌ Some files failed to download.")
+        console.print("\n[bold red]❌ Some files failed to download.[/bold red]")
         sys.exit(1)
 
 
